@@ -1,21 +1,118 @@
 from osgeo import gdal, ogr, osr
 import numpy
-import pylab, math, os, sys,json
+import pylab, math, os, sys,json,datetime
 import pickle
 #########################################################
-#User Params
-res = 3000 #Spatial resolution of output in meters. Generally not much reason to go finer than 30 
-window_radius = 150000 #Distance in meters of radius of each window for each frame (needs to be divisible by res)
-epsg = 5070 #Generally better with UTM which is 326 + zone in northern hemisphere or 327 + zone in southern hemisphere
-wind_threshold = 30. #Threshold in mph for including wind values
-wind_nodata = 0 #Value to set as null for wind output
-wind_datatype = 'u1'#Use the NumPy  datatype format. Generally Byte ('u1') is fine for wind. If more precision is needed, use 'Float32'
-storm_name = 'Michael'
-frames_output_folder = 'windfields_frames/'
-mosaic_output_folder = 'windfields_mosaic/'
-storm_track_json = 'michael-track-refined.json'
-#########################################################
 
+#Function for interpolating track input entries
+def refineStormTrack(input_track,storm_name,storm_year):
+    Today = datetime.datetime.utcnow()
+
+    stormname,stormyear =storm_name,storm_year
+    stormyear = int(stormyear)
+    csvname = os.path.splitext(input_track)[0]
+    outfile = open(csvname+'-refined.csv','w')
+    outfileJSON = open(csvname+'-refined.json','w')
+    refinement_factor = 3
+
+    def GetTime( X ):
+        mytime = X.split(',')[1].split(':')
+        hour = int(mytime[0])
+        mins = 60*int(hour)+int(mytime[1].split(' ')[0])
+        return mins
+
+    def GetInfo( X ):
+        fields = X.strip().split(',')
+        lat = float( fields[2])
+        lon = float( fields[3])
+        WS = float( fields[4].split(' ')[0] )
+        Pr = float( fields[5].split(' ')[0])
+        return [lat,lon,WS,Pr]
+
+    def Interp( s, e, f ):
+        return (1.-f)*s+f*e
+
+    # read csv file of storm track data
+    trackfile = open(csvname + '.csv','r')
+    track = trackfile.readlines()
+    trackfile.close()
+
+    # set start date
+    start = track[0]
+    start_time = GetTime( start )
+    start_info = GetInfo( start )
+
+    # loop through file
+    
+    jsonList = []
+    for end in track[1:]:
+        # read end date
+        end_time = GetTime( end )
+        end_info = GetInfo( end )
+        if start_time>end_time:
+            end_time += 24*60
+
+        # loop over time between
+        desired_dt = int( (end_time-start_time)/refinement_factor )
+        for t in range(0, end_time-start_time, desired_dt):
+            # linear interpolate time, position and other parameters
+            fraction = float(t) / float(end_time-start_time)
+            new_mins = Interp( start_time, end_time, fraction )
+            new_lat = Interp( start_info[0], end_info[0], fraction )
+            new_lon = Interp( start_info[1], end_info[1], fraction )
+            new_WS  = Interp( start_info[2], end_info[2], fraction )
+            new_Pr  = Interp( start_info[3], end_info[3], fraction )
+
+            # write new record
+            hr =int(new_mins/60.)
+            mins = new_mins-hr*60
+            if hr > 23:
+                hr = 0
+            fields = start.strip().split(',')
+
+            OutputDate = datetime.datetime.strptime(fields[0].strip(), '%b %d')
+            if stormyear > Today.year:
+                Forecast = 'F'
+            elif stormyear == Today.year:
+                if OutputDate.month > Today.month:
+                    Forecast = 'F'
+                elif OutputDate.month == Today.month:
+                    if OutputDate.day > Today.day:
+                        Forecast = 'F'
+                    elif OutputDate.day == Today.day:
+                        if hr > Today.hour:
+                            Forecast = 'F'
+                        else:
+                            Forecast = 'O'
+                    else:
+                        Forecast = 'O'
+                else:
+                    Forecast = 'O'
+            else:
+                Forecast = 'O'
+            if Forecast == 'F':
+                refinement_factor = 24
+            out = '%s,%02d:%02d GMT,%4.2f,%4.2f,%d mph,%d mb,%s,%s,%s\n'% (fields[0],hr,mins,new_lat,new_lon,new_WS,new_Pr,fields[-2],fields[-1], Forecast)
+            outfile.write( out )
+
+            fields = out.strip().split(',')
+            wspd = fields[4].split('m')[0]
+            pres = fields[5].split('m')[0]
+            jsonList.append({'date':fields[0]+':'+fields[1],
+              'lat':float(fields[2]),
+              'lon':float(fields[3]),
+              'wspd':float(wspd),
+              'pres':float(pres),
+              'FO':fields[-1]})
+        start = end
+        start_time = GetTime(end)
+        start_info = end_info
+
+    outfileJSON.write(json.dumps(jsonList))
+    outfile.close()
+    outfileJSON.close()
+#########################################################
+#Function for creating directory if it doesn't exist
 def check_dir(in_path):
     if os.path.exists(in_path) == False:
         print('Making dir:', in_path)
@@ -63,7 +160,7 @@ def CalcStormMotion(y1,y2,x1,x2,dt):
     U = (x2-x1) * math.cos(y1*math.pi/180.) * 111. *1000/ float(dt)
     return U,V
 #########################################################
-def getWind(current,future):
+def getWind(current,future,frames_output_folder,storm_name,window_width,window_height,res,wind_nodata,wind_threshold,epsg,wind_summary):
     mytime = current['date'].split(':')
     cseconds = 3600*int(mytime[1])+60*int(mytime[2].split()[0])
     mytime = future['date'].split(':')
@@ -163,13 +260,13 @@ def getWind(current,future):
     del(row)
     del(u)
 ##################################################################
-
+#Object for creating max mosaic of wind fields
 class windSummary:
-    def __init__(self,rows,window_width,window_height,res):
-        self.rows,self.window_width,self.window_height,self.res =rows,window_width,window_height,res
+    def __init__(self,output_name,rows,window_width,window_height,res,epsg,wind_nodata,wind_datatype):
+        self.output_name,self.rows,self.window_width,self.window_height,self.res,self.epsg,self.wind_nodata,self.wind_datatype =output_name,rows,window_width,window_height,res,epsg,wind_nodata,wind_datatype
 
     def getGetFootprintArray(self):
-        coords = [geogToProj(row['lon'],row['lat'],fromEPSG = 4326,toEPSG = epsg) for row in self.rows]
+        coords = [geogToProj(row['lon'],row['lat'],fromEPSG = 4326,toEPSG = self.epsg) for row in self.rows]
         coords =  [[i['x'],i['y']] for i in coords]
     
         xs = [i[0] for i in coords]
@@ -177,18 +274,18 @@ class windSummary:
 
  
         xmin,ymin,xmax,ymax = min(xs),min(ys),max(xs),max(ys)
-        xmin = xmin-window_width*res
-        ymin = ymin-window_height*res
-        xmax = xmax+(window_width+1)*res
-        ymax = ymax+(window_height+1)*res
+        xmin = xmin-self.window_width*self.res
+        ymin = ymin-self.window_height*self.res
+        xmax = xmax+(self.window_width+1)*self.res
+        ymax = ymax+(self.window_height+1)*self.res
         print(xmin,xmax)
-        self.width = math.ceil((xmax-xmin)/res)
-        self.height = math.ceil((ymax-ymin)/res)
+        self.width = math.ceil((xmax-xmin)/self.res)
+        self.height = math.ceil((ymax-ymin)/self.res)
         # print(self.width,self.height)
-        self.footprint = numpy.zeros((self.height,self.width), dtype=wind_datatype)
-        self.footprint[self.footprint == 0] = wind_nodata
+        self.footprint = numpy.zeros((self.height,self.width), dtype=self.wind_datatype)
+        self.footprint[self.footprint == 0] = self.wind_nodata
         print(self.footprint.shape)
-        self.transform = getTransform(xmin,ymax,0,0,res)
+        self.transform = getTransform(xmin,ymax,0,0,self.res)
 
     def updateFootprint(self,array,wind_transform):
         res = wind_transform[1]
@@ -205,7 +302,7 @@ class windSummary:
         del(self.footprint)
 
     def writeSummary(self):
-        writegeotiff( self.transform, self.footprint, os.path.join(mosaic_output_folder, storm_name+'_wind.tif'), self.width, self.height,epsg, wind_nodata,'u1')
+        writegeotiff( self.transform, self.footprint, self.output_name, self.width, self.height,self.epsg, self.wind_nodata,self.wind_datatype)
         self.clearFootprint()
 
 ##################################################################
@@ -240,27 +337,3 @@ class windSummary:
 #         return 0
 
 ##################################################################
-window_width = window_radius/res #Number of pixels for window width radius (5000 will result in 10001 pixels width)
-window_height = window_radius/res #Number of pixels for window height radius (5000 will result in 10001 pixels height)
-
-check_dir(frames_output_folder)
-check_dir(mosaic_output_folder)
-
-o = open(storm_track_json,'r')
-rows = json.loads(o.read())
-o.close()
-
-left = rows[:-1]
-right = rows[1:]
-
-wind_summary = windSummary(left,window_width,window_height,res)
-wind_summary.getGetFootprintArray()
-
-
-
-   
-for left,right in zip(left,right):
-    # print(left,right)
-    getWind(left,right)
-
-wind_summary.writeSummary()

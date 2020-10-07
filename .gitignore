@@ -1,1 +1,3 @@
-outputs
+output_data/
+track_data/*refined*
+__pycache__/
