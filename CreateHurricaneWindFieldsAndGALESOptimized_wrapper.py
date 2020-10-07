@@ -5,7 +5,7 @@ storm_track = 'track_data/michael-track.csv'
 storm_name = 'Michael'
 storm_year = 2018
 
-res = 3000 #Spatial resolution of output in meters. Generally not much reason to go finer than 30 
+res = 300 #Spatial resolution of output in meters. Generally not much reason to go finer than 30 
 window_radius = 150000 #Distance in meters of radius of each window for each frame (needs to be divisible by res)
 epsg = 5070 #Generally better with UTM which is 326 + zone in northern hemisphere or 327 + zone in southern hemisphere
 wind_threshold = 30. #Threshold in mph for including wind values
@@ -47,6 +47,6 @@ wind_summary.getGetFootprintArray()
 #Iterate across each pair of frames 
 for left,right in zip(left,right):
     getWind(left,right,frames_output_folder,storm_name,window_width,window_height,res,wind_nodata,wind_threshold,epsg,wind_summary)
-
+#
 #Write mosaic of wind fields out
 wind_summary.writeSummary()
