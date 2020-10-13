@@ -1,3 +1,4 @@
 output_data/
 track_data/*refined*
+track_data/hurdat_tracks
 __pycache__/

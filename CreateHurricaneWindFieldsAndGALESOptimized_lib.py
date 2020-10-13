@@ -1,9 +1,101 @@
 from osgeo import gdal, ogr, osr
 import numpy
-import pylab, math, os, sys,json,datetime
-import pickle
-#########################################################
+import pylab, math, os, sys,json,datetime,glob
 
+#########################################################
+#Function for getting HURDAT data into the correct format for subsequent processing
+def prep_HURDAT(raw_hurdat,csv_folder,storm_split_str = 'AL'):
+    check_dir(csv_folder)
+
+    #Read in HURDAT data
+    o = open(raw_hurdat,'r')
+
+    #Split out by storm (lines that start with AL)
+    lines = o.read().split(storm_split_str)
+    lines = [i for i in lines if i != '']
+    o.close()
+
+    allJSON = []
+    
+    #Iterate across each storm
+    for h in lines:
+
+        h_out = []
+
+        #Clean up the data
+        h = h.split('\n')
+        if len(h) > 1:
+            h = [i.split(',') for i in h]
+            header = h[0]
+            header = [i.strip() for i in header]
+            h = h[1:]
+            
+            h = [[i2.strip() for i2 in i] for i in h if i[0] != '' and int(i[6]) > 0 and int(i[7]) > 0]
+            
+            #If there are obs for the storm, process it
+            if len(header) ==4 and len(h) > 1 and len(header[0]) > 0:
+                name = header[1]
+                if name == 'UNNAMED':
+                    name = header[2]
+                year = header[0][2:]
+                out_csv = os.path.join(csv_folder,name + '-'+year+'.csv')
+                if os.path.exists(out_csv) == False:
+                    hLines = []
+                    hLinesCSV = ''
+                    #Set up outputs for storm
+                    hObj = {}
+
+                    hObj['name'] = name
+                    hObj['year'] = int(year)
+
+                    for line in h:
+                        lineObj = {}
+
+                        #Get relevant fields and format them
+                        date = line[0]
+                        time = line[1]
+                        y = int(date[:4])
+                        m = int(date[4:6])
+                        d = int(date[6:])
+                        h =int(time[:2])
+                        minutes = int(time[2:])
+                        
+                        date = datetime.datetime(y,m,d,h,minutes)
+                        out_date = date.strftime("%b %d,%H:%M:%S GMT")
+                        
+                        lineObj['date'] = out_date
+                        
+                        lat = float(line[4][:-1])
+                        lon = float(line[5][:-1])
+                        if line[4][-1] == 'S':lat = lat*-1
+                        if line[5][-1] == 'W':lon = lon*-1
+                        lineObj['lat'] = lat
+                        lineObj['lon'] = lon
+                        lineObj['pres'] = int(line[7])
+                        lineObj['wspd'] = int(line[6])
+                        hLines.append(lineObj)
+
+
+                        hLinesCSV += ','.join([out_date,str(lineObj['lat']),str(lineObj['lon']),str(lineObj['wspd']) + ' mph',str(lineObj['pres']) + ' mb\n'])
+                    
+                    
+                    hObj['track'] = hLines
+                    allJSON.append(hObj)
+                    
+                    o = open(out_csv,'w')
+                    o.write(hLinesCSV)
+                    o.close()
+
+                    #Refine storm track
+                    try:
+                        refineStormTrack(out_csv,name,year)
+                    except Exception as e:
+                        print(e)
+    #Write a master json- not used currently    
+    o = open(csv_folder + os.path.basename(os.path.splitext(raw_hurdat)[0]) + '_all.json','w')
+    o.write(json.dumps(allJSON))
+    o.close()
+##############################################################        
 #Function for interpolating track input entries
 def refineStormTrack(input_track,storm_name,storm_year):
     Today = datetime.datetime.utcnow()
@@ -160,7 +252,7 @@ def CalcStormMotion(y1,y2,x1,x2,dt):
     U = (x2-x1) * math.cos(y1*math.pi/180.) * 111. *1000/ float(dt)
     return U,V
 #########################################################
-def getWind(current,future,frames_output_folder,storm_name,window_width,window_height,res,wind_nodata,wind_threshold,epsg,wind_summary):
+def getWind(current,future,frames_output_folder,storm_name,window_width,window_height,res,wind_nodata,wind_threshold,epsg,wind_summary,write_frames = False):
     mytime = current['date'].split(':')
     cseconds = 3600*int(mytime[1])+60*int(mytime[2].split()[0])
     mytime = future['date'].split(':')
@@ -253,7 +345,10 @@ def getWind(current,future,frames_output_folder,storm_name,window_width,window_h
     #Write output
     coords = geogToProj(Lon,Lat,fromEPSG = 4326,toEPSG = epsg)
     transform = getTransform(coords['x'],coords['y'],u.shape[0],u.shape[1],res)
-    writegeotiff( transform, u, out_filename, u.shape[0], u.shape[1],epsg, wind_nodata)
+
+    if write_frames:
+        writegeotiff( transform, u, out_filename, u.shape[0], u.shape[1],epsg, wind_nodata)
+
     wind_summary.updateFootprint(u,transform)
     del(px)
     del(py)
